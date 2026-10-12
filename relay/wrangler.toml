@@ -1,0 +1,29 @@
+name = "rescriva-share-relay"
+main = "worker.js"
+compatibility_date = "2026-09-20"
+workers_dev = true
+
+# Custom domain (needs rescriva.com as a zone in the same Cloudflare account). Keep this above
+# the [[...]] tables below, or TOML files it under the last table. A custom domain takes a bare
+# host name; Cloudflare refuses "/*" on custom domains.
+# routes = [
+#   { pattern = "relay.rescriva.com", custom_domain = true },
+# ]
+# Or, as an ordinary route on an existing proxied DNS record:
+# routes = [
+#   { pattern = "relay.rescriva.com/*", zone_name = "rescriva.com" },
+# ]
+
+# One Durable Object per room. The free plan only offers SQLite-backed Durable Objects.
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "ShareRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ShareRoom"]
+
+# Optional settings:
+# [vars]
+# EXTRA_ORIGINS = "https://staging.example.com,https://preview.example.com"
+# ROOM_SALT is better kept out of this file:  npx wrangler secret put ROOM_SALT
