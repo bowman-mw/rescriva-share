@@ -16,5 +16,5 @@ export function qrSVG(text, label) {
     }
   }
   return `<svg viewBox="0 0 ${size} ${size}" role="img" aria-label="${label}" shape-rendering="crispEdges">` +
-    `<rect width="${size}" height="${size}" fill="#fff"/><path d="${path}" fill="#1d150d"/></svg>`;
+    `<rect width="${size}" height="${size}" fill="#FFFDF8"/><path d="${path}" fill="#1D2233"/></svg>`;
 }
