@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' wss://relay.rescriva.com ws://127.0.0.1:* ws://localhost:*; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="description" content="Move files between Rescriva and this browser, directly and privately.">
+  <meta name="theme-color" content="#FBF7EE" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1C1610" media="(prefers-color-scheme: dark)">
+  <title>Rescriva Share</title>
+  <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Serif+Display&family=Playfair+Display:ital@1&display=swap">
+  <link rel="stylesheet" href="assets/style.css">
+  <script src="assets/vendor/qrcode.js" defer></script>
+  <script src="assets/main.js" type="module"></script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="https://rescriva.com" rel="noopener"><span class="wordmark">Rescriva</span><span class="product">Share</span></a>
+    <p class="status" id="status" aria-live="polite">Starting…</p>
+  </header>
+
+  <main class="layout">
+    <section class="devices" aria-labelledby="devices-title">
+      <h1 id="devices-title" class="section-title">Shared with you</h1>
+      <div id="device-list" class="device-list"></div>
+      <div id="empty" class="empty card">
+        <div id="empty-nearby">
+          <h2>Nothing here yet</h2>
+          <p>Open <b>Share Nearby</b> in Rescriva on an iPhone, iPad or Mac on this network. What it shares shows up here.</p>
+          <p class="muted small">On a different network, or no internet? Pair with the code instead.</p>
+        </div>
+        <div id="empty-link" hidden>
+          <h2>Connecting…</h2>
+          <p>Keep Rescriva's Share screen open on the other device.</p>
+        </div>
+      </div>
+    </section>
+
+    <aside class="pair card" id="pair" aria-labelledby="pair-title">
+      <h2 id="pair-title">Pair with Rescriva</h2>
+      <div id="qr" class="qr waiting"></div>
+      <ol class="steps">
+        <li>In Rescriva, open <b>Share Nearby</b>.</li>
+        <li>Tap <b>Scan a computer's code</b> and point it here. The iPhone camera works too.</li>
+      </ol>
+      <p id="pair-blocked" class="warn small" hidden>This browser isn't allowed to make direct connections. Your organization or an extension may have turned that off.</p>
+      <form id="code-form" class="code-form" autocomplete="off">
+        <label for="code">Rescriva showing a code? Type it here.</label>
+        <div class="code-row">
+          <input id="code" name="code" class="code-input" placeholder="XXXX-XXXX" spellcheck="false" autocapitalize="characters" maxlength="16">
+          <button class="button" type="submit">Connect</button>
+        </div>
+        <p id="code-note" class="small muted" aria-live="polite"></p>
+      </form>
+      <p class="small muted on-this-device">On the computer Rescriva is on? <a id="pair-link" href="#">Open in Rescriva</a></p>
+    </aside>
+  </main>
+
+  <footer class="foot">
+    <p>Files go straight from one device to the other, encrypted. They aren't uploaded anywhere, and this page keeps nothing.
+      <a href="https://github.com/bowman-mw/rescriva-share/blob/main/PROTOCOL.md">How it works</a></p>
+  </footer>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

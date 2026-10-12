@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Rescriva Share tests</title>
+<style>body { font: 14px/1.5 ui-monospace, monospace; padding: 16px; } .fail { color: #b00; } .pass { color: #070; }</style>
+<h1>Rescriva Share tests</h1>
+<pre id="out">Running…</pre>
+<script type="module">
+import { b64url, fromB64url, decodeConnectionCode, encodeConnectionCode, pairingPayload, fingerprintBytes } from "../assets/codes.js";
+import { roomId, iceCredentials, proof } from "../assets/crypto.js";
+import { fingerprint, hostCandidates, syntheticAnswer, sdpValue } from "../assets/sdp.js";
+
+const results = [];
+const check = (name, actual, expected) => {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  results.push({ name, ok, actual, expected });
+};
+
+// PROTOCOL.md §1.1 vectors.
+const secret = Uint8Array.from({ length: 16 }, (_, i) => i + 1);
+check("secret base64url", b64url(secret), "AQIDBAUGBwgJCgsMDQ4PEA");
+check("base64url round trip", [...fromB64url("AQIDBAUGBwgJCgsMDQ4PEA")], [...secret]);
+check("roomId", await roomId(secret), "8o2MFZXsZ_-zenK5lVG13R");
+check("ice", await iceCredentials(secret), { ufrag: "JtdLkDQk", pwd: "ZQTXo83Ch4FIONXev/7A54ci" });
+const fo = Array(32).fill("AA").join(":"), fa = Array(32).fill("BB").join(":");
+check("proof web", await proof(secret, "web", fo, fa), "EpXFwY-xYQ-Pv7kuSqaHTPV91p-Nb4n2AtMQU9ZLUGk");
+check("proof app", await proof(secret, "app", fo, fa), "NuogRNgcibvc8iD5AZFpJUq_MdvVGuhpw622Z3WAd3M");
+
+// §3.1 connection codes.
+const codes = [["172.20.10.1", 52453, "1K75G"], ["192.168.1.37", 54321, "80JBN1HG"], ["10.0.12.200", 61000, "G006CHVJ8Z"], ["172.16.5.9", 50000, "XC202GKGTGM"]];
+for (const [ip, port, code] of codes) {
+  check(`encode ${ip}`, encodeConnectionCode(ip, port), code);
+  check(`decode ${code}`, decodeConnectionCode(code), { ip, port });
+}
+check("decode with dashes, lower case, O for 0", decodeConnectionCode("8ojb-n1hg"), { ip: "192.168.1.37", port: 54321 });
+check("typo fails the check digit", decodeConnectionCode("80JBN1HH"), null);
+check("wrong length", decodeConnectionCode("80JBN1H"), null);
+check("junk", decodeConnectionCode("hello!"), null);
+
+// §3 payload layout.
+const sdp = [
+  "v=0", "a=ice-ufrag:pEeG", "a=ice-pwd:UVxTphq7VLoWl7IGtQnsIRyq",
+  "a=fingerprint:sha-256 3a:51:72:C4:3C:B4:7E:C5:B5:FE:F5:74:0D:3E:98:E5:4C:C9:8E:4B:FA:66:C9:1A:A9:EC:8E:6C:E8:B9:F1:D9",
+  "a=mid:0",
+  "a=candidate:2860851947 1 udp 2113937151 40dae371-93f3-4445-88ec-b805a2838109.local 53909 typ host generation 0",
+  "a=candidate:1 1 udp 2113939711 fe80::1 64410 typ host generation 0",
+  "a=candidate:2 1 udp 2113939711 192.168.1.5 64411 typ host generation 0",
+  "a=candidate:3 1 tcp 1518214911 192.168.1.5 9 typ host tcptype active",
+  "a=candidate:4 1 udp 1677729535 1.2.3.4 50000 typ srflx raddr 0.0.0.0 rport 0",
+].join("\r\n");
+check("fingerprint upper-cased", fingerprint(sdp), "3A:51:72:C4:3C:B4:7E:C5:B5:FE:F5:74:0D:3E:98:E5:4C:C9:8E:4B:FA:66:C9:1A:A9:EC:8E:6C:E8:B9:F1:D9");
+const candidates = hostCandidates(sdp);
+check("UDP host candidates only", candidates.map((c) => c.address), ["40dae371-93f3-4445-88ec-b805a2838109.local", "fe80::1", "192.168.1.5"]);
+const payload = pairingPayload({ secret, ufrag: sdpValue(sdp, "ice-ufrag"), pwd: sdpValue(sdp, "ice-pwd"), fingerprint: fingerprint(sdp), mid: "0", candidates });
+check("payload hex", [...payload].map((b) => b.toString(16).padStart(2, "0")).join(""),
+  "01" + "0102030405060708090a0b0c0d0e0f10" + "04" + hex("pEeG") + "18" + hex("UVxTphq7VLoWl7IGtQnsIRyq") +
+  [...fingerprintBytes(fingerprint(sdp))].map((b) => b.toString(16).padStart(2, "0")).join("") + "01" + hex("0") + "03" +
+  "6d" + "40dae37193f3444588ecb805a2838109" + "d295" +
+  "04" + "c0a80105" + "fb9b" +
+  "06" + "fe800000000000000000000000000001" + "fb9a");
+check("payload base64url", b64url(payload).length > 100, true);
+check("synthetic answer has the app's setup role", syntheticAnswer({ mid: "0", ufrag: "u", pwd: "p", fingerprint: fo }).includes("a=setup:active\r\n"), true);
+
+function hex(text) { return [...text].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join(""); }
+
+const failed = results.filter((r) => !r.ok);
+document.getElementById("out").innerHTML = results.map((r) =>
+  `<span class="${r.ok ? "pass" : "fail"}">${r.ok ? "PASS" : "FAIL"} ${r.name}${r.ok ? "" : `\n  expected ${JSON.stringify(r.expected)}\n  actual   ${JSON.stringify(r.actual)}`}</span>`).join("\n") +
+  `\n\n${results.length - failed.length}/${results.length} passed`;
+window.testResults = { passed: results.length - failed.length, failed: failed.map((f) => f.name) };
+</script>
