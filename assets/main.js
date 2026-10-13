@@ -198,26 +198,36 @@ function render() {
 }
 
 function renderStatus() {
-  const ready = [...connections.values()].some((c) => c.state === "ready");
+  const count = [...connections.values()].filter((c) => c.state === "ready").length;
   let text;
   if (mode === "link") {
     if (!RELAY) text = "This link needs the relay, which is turned off here.";
     else if (linkRelay.status === "unavailable") text = "Can't reach the relay. Check this device's internet connection, then reload.";
-    else if (ready) text = "Connected. Files go straight between the two devices.";
+    else if (count) text = "Connected. Files go straight between the two devices.";
     else if (linkRelay.status === "open" && ![...linkRelay.peers.values()].some((p) => p.role === "app")) {
       text = "Waiting for the device. If its Share screen was closed, scan the new code it shows.";
     } else text = "Connecting to the device that showed you the code…";
   } else if (!RELAY) {
-    text = ready ? "Paired. Files go straight between the two devices." : "Relay off. Pair with the code.";
-  } else if (autoRelay.status === "open") {
-    text = "Looking for Rescriva on this network.";
-  } else if (autoRelay.status === "unavailable") {
-    text = "Can't reach the relay, so devices won't appear on their own. Pair with the code instead.";
+    text = count ? "Paired. Files go straight between the two devices." : "Relay off. Pair with the code.";
   } else {
-    text = "Connecting…";
+    text = nearbyStatus(autoRelay.status, count);
   }
   $("status").textContent = text;
   $("status").dataset.tone = mode === "nearby" && autoRelay?.status === "unavailable" ? "warn" : "";
+}
+
+/** The status line on the nearby page, with `count` devices connected. */
+function nearbyStatus(relayStatus, count) {
+  const connected = count === 1 ? "Connected to 1 device." : `Connected to ${count} devices.`;
+  if (relayStatus === "open") {
+    return count ? `${connected} Others on this network show up here too.` : "Looking for Rescriva on this network.";
+  }
+  if (relayStatus === "unavailable") {
+    return count
+      ? `${connected} Can't reach the relay, so others won't appear on their own. Pair them with the code.`
+      : "Can't reach the relay, so devices won't appear on their own. Pair with the code instead.";
+  }
+  return count ? connected : "Connecting…";
 }
 
 function renderDevices() {
