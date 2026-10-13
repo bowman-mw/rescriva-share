@@ -3,12 +3,12 @@ main = "worker.js"
 compatibility_date = "2026-09-20"
 workers_dev = true
 
-# Custom domain (needs rescriva.com as a zone in the same Cloudflare account). Keep this above
+# Custom domain: rescriva.com is a zone in the same Cloudflare account. Keep this above
 # the [[...]] tables below, or TOML files it under the last table. A custom domain takes a bare
 # host name; Cloudflare refuses "/*" on custom domains.
-# routes = [
-#   { pattern = "relay.rescriva.com", custom_domain = true },
-# ]
+routes = [
+  { pattern = "relay.rescriva.com", custom_domain = true },
+]
 # Or, as an ordinary route on an existing proxied DNS record:
 # routes = [
 #   { pattern = "relay.rescriva.com/*", zone_name = "rescriva.com" },
