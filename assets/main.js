@@ -74,12 +74,20 @@ function watch(relay, secret) {
       connection.close("failed");
     });
   };
-  relay.addEventListener("peers", (e) => e.detail.forEach(dial));
-  relay.addEventListener("join", (e) => dial(e.detail));
+  // Who's in the room changes the status line and the "Connecting…" cards, so render after each change.
+  relay.addEventListener("peers", (e) => {
+    e.detail.forEach(dial);
+    render();
+  });
+  relay.addEventListener("join", (e) => {
+    dial(e.detail);
+    render();
+  });
   relay.addEventListener("leave", (e) => {
     // A connection that's open carries on without the relay; the app says bye when it stops.
     const connection = connections.get(e.detail.id);
     if (connection && connection.state === "connecting") connection.close("left");
+    render();
   });
   relay.addEventListener("signal", (e) => connections.get(e.detail.from)?.signal(e.detail.data));
   relay.addEventListener("status", render);
@@ -200,7 +208,7 @@ function renderStatus() {
       text = "Waiting for the device. If its Share screen was closed, scan the new code it shows.";
     } else text = "Connecting to the device that showed you the code…";
   } else if (!RELAY) {
-    text = "Relay off. Pair with the code.";
+    text = ready ? "Paired. Files go straight between the two devices." : "Relay off. Pair with the code.";
   } else if (autoRelay.status === "open") {
     text = "Looking for Rescriva on this network.";
   } else if (autoRelay.status === "unavailable") {
@@ -428,7 +436,7 @@ class DocRow {
     this.message.textContent = {
       wrong: result.left > 0
         ? `That's not it. ${result.left} ${result.left === 1 ? "try" : "tries"} left before the PIN changes.`
-        : "That's not it. The PIN has changed. Check Rescriva for the new one.",
+        : `That's not it. The PIN has changed. Check Rescriva for the new one, then try again in ${result.retryIn || 30} seconds.`,
       cooldown: `Too many wrong PINs. Try again in ${result.retryIn || 30} seconds, using the new PIN in Rescriva.`,
       locked: "This file isn't shared any more.",
       gone: "This file isn't shared any more.",
@@ -484,11 +492,13 @@ function percent(t) {
   return t.size ? `${Math.floor((t.done / t.size) * 100)}%` : "";
 }
 
+/** Like the app's sizes (Apple's file sizes): 1 KB is 1,000 bytes, so both show "731 KB". */
 function formatBytes(bytes) {
   if (!(bytes >= 0)) return "";
-  if (bytes < 1024) return `${bytes} bytes`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+  if (bytes < 1000) return `${bytes} bytes`;
+  if (Math.round(bytes / 1e3) < 1000) return `${Math.round(bytes / 1e3)} KB`;
+  if (bytes < 1e9) return `${(bytes / 1e6).toFixed(1)} MB`;
+  return `${(bytes / 1e9).toFixed(2)} GB`;
 }
 
 let toastTimer;
