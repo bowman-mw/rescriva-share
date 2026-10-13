@@ -6,9 +6,15 @@ export function sdpValue(sdp, key) {
   return match ? match[1].trim() : null;
 }
 
-/** The SHA-256 fingerprint, upper case, as the proof uses it. */
+/**
+ * The SHA-256 fingerprint, upper case, as the proof uses it. Null unless the
+ * description has exactly one fingerprint line: with two, the one a proof names
+ * might not be the one DTLS checks.
+ */
 export function fingerprint(sdp) {
-  const match = sdp.match(/^a=fingerprint:sha-256 ([0-9A-Fa-f:]+)/m);
+  const lines = sdp.match(/^a=fingerprint:.*$/gm) || [];
+  if (lines.length !== 1) return null;
+  const match = lines[0].match(/^a=fingerprint:sha-256 ((?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2})\s*$/);
   return match ? match[1].toUpperCase() : null;
 }
 

@@ -58,6 +58,8 @@ check("payload hex", [...payload].map((b) => b.toString(16).padStart(2, "0")).jo
   "04" + "c0a80105" + "fb9b" +
   "06" + "fe800000000000000000000000000001" + "fb9a");
 check("payload base64url", b64url(payload).length > 100, true);
+check("two fingerprint lines → none", fingerprint(`a=fingerprint:sha-256 ${fo}\r\na=fingerprint:sha-256 ${fa}\r\n`), null);
+check("short fingerprint → none", fingerprint("a=fingerprint:sha-256 AA:BB\r\n"), null);
 check("synthetic answer has the app's setup role", syntheticAnswer({ mid: "0", ufrag: "u", pwd: "p", fingerprint: fo }).includes("a=setup:active\r\n"), true);
 
 function hex(text) { return [...text].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join(""); }
