@@ -1,7 +1,8 @@
 name = "rescriva-share-relay"
 main = "worker.js"
 compatibility_date = "2026-09-20"
-workers_dev = true
+# relay.rescriva.com is the only entry point: no second address on workers.dev.
+workers_dev = false
 
 # Custom domain: rescriva.com is a zone in the same Cloudflare account. Keep this above
 # the [[...]] tables below, or TOML files it under the last table. A custom domain takes a bare
@@ -23,7 +24,16 @@ class_name = "ShareRoom"
 tag = "v1"
 new_sqlite_classes = ["ShareRoom"]
 
+# New connections to /ws per client address: 20 a minute, counted per Cloudflare location and
+# only roughly (see the README). Over that the Worker answers 429. Needs Wrangler 4.36 or later.
+# Remove the table and the Worker simply skips the check. namespace_id is any integer that is
+# unique within the account, written as a string; period must be 10 or 60.
+[[ratelimits]]
+name = "WS_LIMIT"
+namespace_id = "1001"
+simple = { limit = 20, period = 60 }
+
 # Optional settings:
 # [vars]
 # EXTRA_ORIGINS = "https://staging.example.com,https://preview.example.com"
-# ROOM_SALT is better kept out of this file:  npx wrangler secret put ROOM_SALT
+# ROOM_SALT must be a secret, set before the relay goes live:  npx wrangler secret put ROOM_SALT

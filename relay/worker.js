@@ -3,6 +3,10 @@
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PEERS = 32;
+// Peers one public address (an IPv4 address, or an IPv6 /64) may hold in a pairing room, so a
+// single host can't fill it (M3). Auto rooms aren't capped this way: an IPv4 auto room is one
+// public address by construction (networkRoomKey), so the cap would be the room's real limit.
+const MAX_PEERS_PER_IP = 4;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 // Clients ping every 25 s. A peer silent for this long is dropped when someone else joins,
 // so a device that vanished without closing its socket doesn't linger as a ghost.
@@ -25,11 +29,6 @@ export default {
     const get = request.method === "GET" || request.method === "HEAD";
     if (pathname === "/ws" && request.method === "GET") return connect(request, env);
     if (get && pathname === "/") return text("Rescriva Share relay\n");
-    if (get && pathname === "/health") {
-      // The page may probe this with fetch() to see whether the relay is reachable.
-      const headers = origin ? { "Access-Control-Allow-Origin": origin, Vary: "Origin" } : {};
-      return text("ok", 200, headers);
-    }
     return text("not found\n", 404);
   },
 };
@@ -47,10 +46,21 @@ async function connect(request, env) {
   if (!DEVICES.has(device)) return text("bad device\n", 400);
   const name = cleanName(q.get("name") || "");
 
-  const key = room === "auto" ? await networkRoomKey(request, env) : "p:" + room;
+  // New connections per address are budgeted by the WS_LIMIT binding (wrangler.toml): each one
+  // is a Worker and a Durable Object request, so a loop of them would use up the daily quota.
+  // The budget is per IPv4 address or IPv6 /64 (`addressKey`): an IPv6 host can give itself any
+  // number of addresses in its /64, so keying on the whole address would hand it a fresh budget
+  // each time. The binding is optional, so `wrangler dev` without it (and the Python stand-in)
+  // still work.
+  if (env.WS_LIMIT && !(await withinLimit(env.WS_LIMIT, addressKey(request)))) {
+    return text("too many connections, try again in a minute\n", 429, { "Retry-After": "60" });
+  }
+
+  const auto = room === "auto";
+  const key = auto ? await networkRoomKey(request, env) : "p:" + room;
   const stub = env.ROOMS.get(env.ROOMS.idFromName(key));
   const inner = new URL("https://room/ws");
-  inner.search = new URLSearchParams({ role, name, device }).toString();
+  inner.search = new URLSearchParams({ role, name, device, auto: auto ? "1" : "0" }).toString();
   return stub.fetch(inner.toString(), { headers: request.headers });
 }
 
@@ -72,20 +82,31 @@ export class ShareRoom extends DurableObject {
 
     this.sweepStale();
     const others = this.peers();
-    if (others.length >= MAX_PEERS) {
-      // Accepted through the hibernation API too, but with no attachment, so it never counts as a peer.
-      this.ctx.acceptWebSocket(server);
-      server.send(JSON.stringify({ t: "error", message: "room full" }));
-      server.close(1008, "room full");
-      return new Response(null, { status: 101, webSocket: client });
+    if (others.length >= MAX_PEERS) return this.refuse(client, server, "room full");
+    // The outer Worker forwards the original headers, so CF-Connecting-IP is the client's real
+    // address. `wrangler dev` may not set it; then every local client counts as one address.
+    // Pairing rooms only (PROTOCOL.md §2): an auto room already is one address.
+    const ip = addressKey(request);
+    if (q.get("auto") !== "1" && others.filter((p) => p.info.ip === ip).length >= MAX_PEERS_PER_IP) {
+      return this.refuse(client, server, "too many connections");
     }
 
     const me = { id: newId(), role: q.get("role"), name: q.get("name"), device: q.get("device") };
     this.ctx.acceptWebSocket(server);
-    server.serializeAttachment({ ...me, joined: Date.now(), seen: 0 });
+    // `ip` lives only in the attachment; publicInfo never shows it to other peers.
+    server.serializeAttachment({ ...me, ip, joined: Date.now(), seen: 0 });
     server.send(JSON.stringify({ t: "welcome", id: me.id, peers: others.map((p) => publicInfo(p.info)) }));
     const join = JSON.stringify({ t: "join", peer: me });
     for (const p of others) safeSend(p.ws, join);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  // Tells the client why, then closes. Accepted through the hibernation API too, but with no
+  // attachment, so it never counts as a peer.
+  refuse(client, server, reason) {
+    this.ctx.acceptWebSocket(server);
+    server.send(JSON.stringify({ t: "error", message: reason }));
+    server.close(1008, reason);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -111,7 +132,9 @@ export class ShareRoom extends DurableObject {
     if (msg.t !== "signal" || typeof msg.to !== "string") return;
     if (!msg.data || typeof msg.data !== "object" || Array.isArray(msg.data)) return;
     const target = this.peers(me.id).find((p) => p.info.id === msg.to);
-    if (target) safeSend(target.ws, JSON.stringify({ t: "signal", from: me.id, data: msg.data }));
+    // Only web <-> app (PROTOCOL.md §2): pages never signal pages, apps never signal apps.
+    if (!target || target.info.role === me.role) return;
+    safeSend(target.ws, JSON.stringify({ t: "signal", from: me.id, data: msg.data }));
   }
 
   async webSocketClose(ws) {
@@ -169,7 +192,32 @@ function originAllowed(origin, env) {
   return (env.EXTRA_ORIGINS || "")
     .split(",")
     .map((s) => s.trim().replace(/\/+$/, "").toLowerCase())
+    .filter((s) => s !== "") // an unset list or a trailing comma must not admit an empty Origin
     .includes(origin.toLowerCase());
+}
+
+// True when the address still has budget. The limiter is best effort (counted per Cloudflare
+// location, eventually consistent), and if it errors the connection goes through rather than
+// the relay going down; the WAF rule in the README is the backstop.
+async function withinLimit(limiter, key) {
+  try {
+    const { success } = await limiter.limit({ key });
+    return success !== false;
+  } catch {
+    return true;
+  }
+}
+
+function clientIP(request) {
+  return (request.headers.get("CF-Connecting-IP") || "").trim();
+}
+
+// What the per-address limits count by: the IPv4 address, or the IPv6 /64 (an IPv6 host can
+// use any address in its /64, so the prefix is the host as far as the relay can tell); "local"
+// when there's no address (`wrangler dev`).
+function addressKey(request) {
+  const ip = clientIP(request);
+  return ip ? (networkPrefix(ip) ?? ip) : "local";
 }
 
 function cleanName(raw) {
@@ -177,7 +225,7 @@ function cleanName(raw) {
 }
 
 async function networkRoomKey(request, env) {
-  const ip = (request.headers.get("CF-Connecting-IP") || "").trim();
+  const ip = clientIP(request);
   // `wrangler dev` may not set CF-Connecting-IP; then every local client shares one room.
   const prefix = ip ? (networkPrefix(ip) ?? ip) : "local";
   const salt = env.ROOM_SALT || "rescriva-share";

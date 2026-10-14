@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """Black-box tests for the Rescriva Share relay (worker.js under `wrangler dev`, or dev_relay.py).
 
-    python3 test_relay.py [ws://127.0.0.1:8787/ws] [--cap N] [--stale-after S]
+    python3 test_relay.py [ws://127.0.0.1:8787/ws] [--cap N] [--per-ip N] [--stale-after S]
+                          [--rate N] [--extra-origin ORIGIN] [-k NAME]
 
 Python 3.9+, standard library only. --cap N runs the "room full" case against a relay whose
-cap is N (start dev_relay.py with --max-peers N to keep it small). --stale-after S runs the
-ghost-peer case against a relay that drops peers silent for S seconds (dev_relay.py --stale-after S).
+cap is N (start dev_relay.py with --max-peers N to keep it small). --per-ip N is the relay's
+per-address cap (default 4; dev_relay.py --max-per-ip N). --stale-after S runs the ghost-peer
+case against a relay that drops peers silent for S seconds (dev_relay.py --stale-after S).
+--rate N runs only the connection-budget case, against a relay that allows N new connections a
+minute per address (dev_relay.py --connections-per-minute N); the other cases would use up that
+budget. --extra-origin ORIGIN checks that an EXTRA_ORIGINS entry is allowed while an empty Origin
+still isn't (start dev_relay.py with EXTRA_ORIGINS="ORIGIN," to include a trailing empty entry).
+
+The per-address cases act as several addresses by sending CF-Connecting-IP, which dev_relay.py
+honours (and `wrangler dev` does if it passes the header through). Cloudflare overwrites it on
+the real relay, which also budgets new connections per address, so against
+wss://relay.rescriva.com run a few cases at a time with -k rather than the whole suite.
 """
 
 import argparse
@@ -54,7 +65,7 @@ class WS:
         self.frag_op = None
 
     @staticmethod
-    def open(url, params=None, origin=None, timeout=5.0):
+    def open(url, params=None, origin=None, timeout=5.0, headers=None):
         """Returns (status, body, ws). ws is None unless the server answered 101."""
         u = urlsplit(url)
         port = u.port or (443 if u.scheme == "wss" else 80)
@@ -68,6 +79,8 @@ class WS:
                  f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
         if origin is not None:
             lines.append(f"Origin: {origin}")
+        for k, v in (headers or {}).items():
+            lines.append(f"{k}: {v}")
         sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         ws = WS(sock)
         head = ws._read_until(b"\r\n\r\n", time.monotonic() + timeout)
@@ -248,13 +261,23 @@ def room():
     return base64.urlsafe_b64encode(secrets.token_bytes(17)).decode()[:22]
 
 
-def join(room_id, role="web", name=None, device="computer", origin=None):
+def as_ip(ip):
+    """Headers that make a local relay treat the connection as coming from `ip`."""
+    return {"CF-Connecting-IP": ip} if ip else None
+
+
+def local_relay():
+    """A local relay honours CF-Connecting-IP; Cloudflare replaces it with the real address."""
+    return urlsplit(URL).scheme == "ws"
+
+
+def join(room_id, role="web", name=None, device="computer", origin=None, ip=None):
     params = {"room": room_id, "role": role}
     if name is not None:
         params["name"] = name
     if device is not None:
         params["device"] = device
-    status, body, ws = WS.open(URL, params, origin)
+    status, body, ws = WS.open(URL, params, origin, headers=as_ip(ip))
     if ws is None:
         raise Fail(f"expected 101 for {params}, got {status} {body.strip()!r}")
     OPEN.append(ws)
@@ -266,8 +289,8 @@ def join(room_id, role="web", name=None, device="computer", origin=None):
     return ws
 
 
-def status_of(params, origin=None):
-    status, _, ws = WS.open(URL, params, origin)
+def status_of(params, origin=None, ip=None):
+    status, _, ws = WS.open(URL, params, origin, headers=as_ip(ip))
     if ws:
         OPEN.append(ws)
         ws.close()
@@ -299,12 +322,11 @@ def offer(text="v=0"):
 def t_http_routes():
     s, body, _ = http_get("/")
     check(s == 200 and "Rescriva Share relay" in body, f"GET / -> {s} {body!r}")
-    s, body, h = http_get("/health")
-    check(s == 200 and body.strip() == "ok", f"GET /health -> {s} {body!r}")
-    s, body, h = http_get("/health", origin="http://localhost:3000")
-    check(h.get("access-control-allow-origin") == "http://localhost:3000", f"/health CORS header {h}")
-    s, _, _ = http_get("/nope")
-    check(s == 404, f"GET /nope -> {s}")
+    s, body, _ = http_get("/", origin="http://localhost:3000")
+    check(s == 200, f"GET / with an allowed Origin -> {s}")
+    for path in ["/nope", "/health"]:  # /health was removed; nothing probes it
+        s, _, _ = http_get(path)
+        check(s == 404, f"GET {path} -> {s}")
     s, _, _ = http_get("/ws?room=auto&role=web")
     check(s in (400, 426), f"GET /ws without Upgrade -> {s}")
 
@@ -356,6 +378,29 @@ def t_signal_both_ways():
     check(m == {"t": "signal", "from": app.id, "data": cand}, f"candidate: {m}")
 
 
+def t_signal_roles():
+    # Signals pass only between a web peer and an app peer; web->web and app->app are dropped.
+    r = room()
+    web1 = join(r, "web")
+    web2 = join(r, "web")
+    app1 = join(r, "app", device="iphone")
+    app2 = join(r, "app", device="ipad")
+    for p in (web1, web2, app1):  # read the joins that piled up
+        while p.recv_json(0.2) is not None:
+            pass
+    web1.send_json({"t": "signal", "to": web2.id, "data": offer("web to web")})
+    app1.send_json({"t": "signal", "to": app2.id, "data": offer("app to app")})
+    web2.expect_silence(1.0, "nothing at the other web peer")
+    app2.expect_silence(0.2, "nothing at the other app peer")
+    web1.send_json({"t": "signal", "to": app2.id, "data": offer("web to app")})
+    m = app2.expect(lambda m: m.get("t") == "signal", what="web->app signal")
+    check(m == {"t": "signal", "from": web1.id, "data": offer("web to app")}, f"web->app: {m}")
+    app2.send_json({"t": "signal", "to": web1.id, "data": {"sdp": {"type": "answer", "sdp": "app to web"}}})
+    m = web1.expect(lambda m: m.get("t") == "signal", what="app->web signal")
+    check(m["from"] == app2.id and m["data"]["sdp"]["sdp"] == "app to web", f"app->web: {m}")
+    web2.expect_silence(0.2, "the dropped signals never arrive late")
+
+
 def t_unknown_target_ignored():
     r = room()
     a = join(r, "web")
@@ -400,13 +445,14 @@ def t_bad_device_rejected():
 
 
 def t_disallowed_origin_403():
-    for o in ["https://evil.example", "null", "https://share.rescriva.com.evil.com", "http://share.rescriva.com",
-              "https://share.rescriva.com:8443", "http://localhost.evil.com", "https://localhost:3000",
-              "http://127.0.0.2:8000", "http://localhost:abc"]:
+    # "" is the empty Origin that an unset EXTRA_ORIGINS once let through ("".split(",") is [""]).
+    for o in ["https://evil.example", "null", "", "https://share.rescriva.com.evil.com",
+              "http://share.rescriva.com", "https://share.rescriva.com:8443", "http://localhost.evil.com",
+              "https://localhost:3000", "http://127.0.0.2:8000", "http://localhost:abc"]:
         s = status_of({"room": room(), "role": "web"}, origin=o)
-        check(s == 403, f"Origin {o} -> {s}")
-    s, _, _ = http_get("/health", origin="https://evil.example")
-    check(s == 403, f"/health with bad Origin -> {s}")
+        check(s == 403, f"Origin {o!r} -> {s}")
+    s, _, _ = http_get("/", origin="https://evil.example")
+    check(s == 403, f"GET / with bad Origin -> {s}")
 
 
 def t_allowed_origin_ok():
@@ -484,27 +530,112 @@ def t_abrupt_disconnect():
     a.expect_silence(1.5, "a single leave")
 
 
-def t_peer_cap(cap):
+def expect_refusal(ws, reason):
+    """The relay accepted the socket only to say `reason` and close it with 1008."""
+    m = ws.recv_json(3)
+    check(m == {"t": "error", "message": reason}, f"{reason} message: {m}")
+    try:
+        ws.recv(3)
+        raise Fail(f"expected a close after {reason}")
+    except Closed as c:
+        check(c.code == 1008 and c.reason == reason, f"close {c.code} {c.reason!r}, want 1008 {reason!r}")
+
+
+def t_peer_cap(cap, per_ip):
     r = room()
-    peers = [join(r, "web" if i % 2 else "app") for i in range(cap)]
+    # Spread the peers over addresses so the per-address cap doesn't fire before the room cap.
+    peers = [join(r, "web" if i % 2 else "app", ip=f"198.51.100.{i // per_ip}") for i in range(cap)]
     for p in peers:  # read the joins that piled up
         while p.recv_json(0.2) is not None:
             pass
-    status, _, extra = WS.open(URL, {"room": r, "role": "web"})
+    status, _, extra = WS.open(URL, {"room": r, "role": "web"}, headers=as_ip("198.51.100.250"))
     check(status == 101, f"over-cap upgrade -> {status}")
     OPEN.append(extra)
-    m = extra.recv_json(3)
-    check(m == {"t": "error", "message": "room full"}, f"room full message: {m}")
-    try:
-        extra.recv(3)
-        raise Fail("expected a close after room full")
-    except Closed as c:
-        check(c.code == 1008, f"close code {c.code}")
+    expect_refusal(extra, "room full")
     peers[0].expect_silence(0.5, "no join for the refused peer")
     peers[-1].close()
     peers[0].expect(lambda m: m.get("t") == "leave", what="leave")
-    again = join(r, "web")
+    again = join(r, "web", ip="198.51.100.250")
     check(len(again.welcome["peers"]) == cap - 1, "room should accept a peer again after one left")
+
+
+def t_per_ip_cap(per_ip):
+    r = room()
+    ip, other_ip = "203.0.113.4", "203.0.113.5"
+    peers = [join(r, "web" if i % 2 else "app", ip=ip) for i in range(per_ip)]
+    for p in peers:  # read the joins that piled up
+        while p.recv_json(0.2) is not None:
+            pass
+    status, _, extra = WS.open(URL, {"room": r, "role": "app"}, headers=as_ip(ip))
+    check(status == 101, f"over-cap upgrade -> {status}")
+    OPEN.append(extra)
+    expect_refusal(extra, "too many connections")
+    peers[0].expect_silence(0.5, "no join for the refused peer")
+    if local_relay():
+        other = join(r, "web", ip=other_ip)
+        check(len(other.welcome["peers"]) == per_ip, f"another address should still get in: {other.welcome}")
+        peers[0].expect(lambda m: m.get("t") == "join" and m["peer"]["id"] == other.id, what="join from the other address")
+        # The cap is per room: the same address starts fresh in another room.
+        elsewhere = join(room(), "web", ip=ip)
+        check(elsewhere.welcome["peers"] == [], "the cap must not leak across rooms")
+    peers[-1].close()
+    peers[0].expect(lambda m: m == {"t": "leave", "id": peers[-1].id}, what="leave")
+    again = join(r, "web", ip=ip)
+    check(any(p["id"] == peers[0].id for p in again.welcome["peers"]), "the address should get its slot back after one left")
+
+
+def t_connection_rate(rate):
+    ip, other_ip = "203.0.113.9", "203.0.113.10"
+    for i in range(rate):
+        s = status_of({"room": room(), "role": "web"}, ip=ip)
+        check(s == 101, f"connection {i + 1} of {rate} -> {s}")
+    status, body, ws = WS.open(URL, {"room": room(), "role": "web"}, headers=as_ip(ip))
+    check(status == 429 and ws is None, f"connection {rate + 1} -> {status} {body.strip()!r}")
+    check(status_of({"room": room(), "role": "web"}, ip=other_ip) == 101, "another address should still connect")
+    s = status_of({"room": "nope", "role": "web"}, ip=ip)
+    check(s == 400, f"bad parameters are refused before the budget is checked -> {s}")
+    if local_relay():
+        # IPv6: every address in one /64 is one host, and shares the budget.
+        for i in range(rate):
+            s = status_of({"room": room(), "role": "web"}, ip=f"2001:db8:5:6::{i + 1:x}")
+            check(s == 101, f"IPv6 connection {i + 1} of {rate} -> {s}")
+        status, body, ws = WS.open(URL, {"room": room(), "role": "web"}, headers=as_ip("2001:db8:5:6:abcd:ef01::9"))
+        check(status == 429 and ws is None, f"another address in the same /64 -> {status} {body.strip()!r}")
+        check(status_of({"room": room(), "role": "web"}, ip="2001:db8:5:7::1") == 101, "another /64 should still connect")
+
+
+def t_ipv6_prefix_cap(per_ip):
+    # Two IPv6 addresses in one /64 count as one address; another /64 is another address.
+    r = room()
+    peers = [join(r, "web" if i % 2 else "app", ip=f"2001:db8:9:1::{i + 1:x}") for i in range(per_ip)]
+    for p in peers:  # read the joins that piled up
+        while p.recv_json(0.2) is not None:
+            pass
+    status, _, extra = WS.open(URL, {"room": r, "role": "app"}, headers=as_ip("2001:db8:9:1:dead:beef::1"))
+    check(status == 101, f"over-cap upgrade -> {status}")
+    OPEN.append(extra)
+    expect_refusal(extra, "too many connections")
+    other = join(r, "web", ip="2001:db8:9:2::1")
+    check(len(other.welcome["peers"]) == per_ip, f"another /64 should still get in: {other.welcome}")
+
+
+def t_auto_room_not_capped_per_address(per_ip):
+    # An IPv4 auto room is one public address by construction, so it takes more than per_ip
+    # sockets from that address; only the room cap applies.
+    tag = secrets.token_hex(3)
+    peers = [join("auto", "web" if i % 2 else "app", f"auto-{tag}-{i}", ip="198.51.100.77") for i in range(per_ip + 2)]
+    for p in peers:
+        while p.recv_json(0.2) is not None:
+            pass
+    ids = {p.id for p in peers}
+    last = join("auto", "web", f"auto-{tag}-last", ip="198.51.100.77")
+    seen = {p["id"] for p in last.welcome["peers"]}
+    check(ids <= seen, f"every socket from the one address should be in the auto room: missing {ids - seen}")
+
+
+def t_extra_origin(extra):
+    check(status_of({"room": room(), "role": "web"}, origin=extra) == 101, f"EXTRA_ORIGINS entry {extra} refused")
+    check(status_of({"room": room(), "role": "web"}, origin="") == 403, "an empty Origin must not pass via EXTRA_ORIGINS")
 
 
 def t_stale_peer(stale_after):
@@ -527,14 +658,34 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("url", nargs="?", default=URL)
     ap.add_argument("--cap", type=int, help="the relay's peer cap; runs the room-full case")
+    ap.add_argument("--per-ip", type=int, default=4, help="the relay's per-address cap (default 4)")
     ap.add_argument("--stale-after", type=float, help="the relay's stale timeout; runs the ghost-peer case")
+    ap.add_argument("--rate", type=int, help="the relay's new connections a minute per address; runs the budget case")
+    ap.add_argument("--extra-origin", help="an origin the relay was started with in EXTRA_ORIGINS; runs that case")
     ap.add_argument("-k", help="only run cases whose name contains this")
     args = ap.parse_args()
     URL = args.url
+    if args.rate and not args.k:
+        print("--rate: running only the connection_rate case (the others would use up the budget)")
+        args.k = "connection_rate"
 
-    cases = [(n[2:], f) for n, f in globals().items() if n.startswith("t_") and n not in ("t_peer_cap", "t_stale_peer")]
-    cases.append(("peer_cap", (lambda: t_peer_cap(args.cap)) if args.cap else None))
+    optional = ("t_signal_roles", "t_peer_cap", "t_per_ip_cap", "t_ipv6_prefix_cap", "t_auto_room_not_capped_per_address",
+                "t_stale_peer", "t_connection_rate", "t_extra_origin")
+    cases = [(n[2:], f) for n, f in globals().items() if n.startswith("t_") and n not in optional]
+    # Four peers share one room here, so a room cap under 4 would fill the room first.
+    cases.append(("signal_roles", t_signal_roles if not args.cap or args.cap >= 4 else None))
+    cases.append(("peer_cap", (lambda: t_peer_cap(args.cap, args.per_ip)) if args.cap else None))
+    # With a room cap at or under the per-address cap, "room full" would fire first.
+    room_for_cap = not args.cap or args.cap > args.per_ip
+    cases.append(("per_ip_cap", (lambda: t_per_ip_cap(args.per_ip)) if room_for_cap else None))
+    # These act as several addresses, which only a local relay lets a client do.
+    local = urlsplit(args.url).scheme == "ws"
+    cases.append(("ipv6_prefix_cap", (lambda: t_ipv6_prefix_cap(args.per_ip)) if room_for_cap and local else None))
+    cases.append(("auto_room_not_capped_per_address",
+                  (lambda: t_auto_room_not_capped_per_address(args.per_ip)) if local and (not args.cap or args.cap > args.per_ip + 3) else None))
     cases.append(("stale_peer", (lambda: t_stale_peer(args.stale_after)) if args.stale_after else None))
+    cases.append(("connection_rate", (lambda: t_connection_rate(args.rate)) if args.rate else None))
+    cases.append(("extra_origin", (lambda: t_extra_origin(args.extra_origin)) if args.extra_origin else None))
     print(f"Testing {URL}")
     failed = 0
     for name, fn in cases:

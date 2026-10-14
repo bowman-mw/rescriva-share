@@ -3,20 +3,39 @@
 
 import { relayURL } from "./config.js";
 import { fromB64url } from "./codes.js";
-import { roomId } from "./crypto.js";
+import { formatCheckNumber, roomId } from "./crypto.js";
 import { Pairing } from "./pairing.js";
 import { AppConnection, saveFile } from "./peer.js";
 import { qrSVG } from "./qr.js";
 import { RelayClient } from "./relay.js";
+
+// Inside another site's frame the page shows nothing and does nothing: a meta CSP can't
+// set frame-ancestors, and a hidden frame could be clicked through.
+if (top !== self) {
+  document.documentElement.hidden = true;
+  throw new Error("Rescriva Share doesn't run inside another page");
+}
 
 const me = describeBrowser();
 const RELAY = relayURL();
 
 /** Every connection to an app, by key (a relay peer id, or "direct:<room>"). */
 const connections = new Map();
-/** Relay peers not to dial again (a duplicate of a better connection). */
-const retired = new Set();
+/**
+ * Relay peers held back as duplicates: peer id → the connection they lost to. An entry
+ * goes when that connection closes or the peer leaves the room, so nobody is shut out
+ * for good (see `dedupe`).
+ */
+const retired = new Map();
+/** Relay peers whose connection dropped: peer id → {tries, timer} for the next try. */
+const redials = new Map();
+/** How to dial a peer in each relay room the page watches. */
+const dialers = new Map();
 const cards = new Map();
+
+const REDIAL_TRIES = 10;
+/** Closings that a fresh offer might get past. */
+const REDIAL_REASONS = new Set(["unreachable", "no-hello", "failed", "closed", "dropped"]);
 
 let mode = "nearby"; // "nearby" | "link"
 let autoRelay = null;
@@ -69,11 +88,13 @@ function watch(relay, secret) {
     if (peer.role !== "app" || connections.has(peer.id) || retired.has(peer.id)) return;
     const connection = AppConnection.viaRelay(relay, peer, secret, me);
     adopt(peer.id, connection);
+    connection.addEventListener("closed", (e) => retry(relay, peer, connection, e.detail));
     connection.offer().catch((error) => {
       console.warn("Rescriva Share: couldn't start a connection", error);
       connection.close("failed");
     });
   };
+  dialers.set(relay, dial);
   // Who's in the room changes the status line and the "Connecting…" cards, so render after each change.
   relay.addEventListener("peers", (e) => {
     e.detail.forEach(dial);
@@ -87,6 +108,7 @@ function watch(relay, secret) {
     // A connection that's open carries on without the relay; the app says bye when it stops.
     const connection = connections.get(e.detail.id);
     if (connection && connection.state === "connecting") connection.close("left");
+    forgetPeer(e.detail.id);
     render();
   });
   relay.addEventListener("signal", (e) => connections.get(e.detail.from)?.signal(e.detail.data));
@@ -94,10 +116,58 @@ function watch(relay, secret) {
   return relay;
 }
 
+function unwatch(relay) {
+  if (!relay) return;
+  relay.stop();
+  dialers.delete(relay);
+  relay.peers.forEach((peer) => forgetPeer(peer.id));
+  relay.peers.clear();
+}
+
+/** A relay peer is gone: nothing to hold against its id, nothing to retry. */
+function forgetPeer(id) {
+  retired.delete(id);
+  clearTimeout(redials.get(id)?.timer);
+  redials.delete(id);
+}
+
+/**
+ * A relay connection ended. When the drop looked transient and the device is still in
+ * the room, dial it again after a pause that doubles each time (2 s, 4 s … 30 s), up to
+ * REDIAL_TRIES. Neither side restarts ICE, so a fresh offer is the only way back. A
+ * device that isn't in the room any more can't be redialed: a paired one left its
+ * pairing room on purpose (both ends do, once paired), so its code has to be scanned
+ * again; a same-network one is dialed afresh when the relay lists it again. "Stopped
+ * sharing" is only ever said for the app's own `bye` (see `adopt`).
+ */
+function retry(relay, peer, connection, { reason, wasReady }) {
+  const name = peer.name || "the device";
+  if (!REDIAL_REASONS.has(reason)) return;
+  if (!relay.peers.has(peer.id)) {
+    if (wasReady && connection.trusted) toast(`Lost the connection to ${name}. Scan its code again to reconnect.`);
+    else if (wasReady) toast(`Lost the connection to ${name}.`);
+    return;
+  }
+  const tries = (redials.get(peer.id)?.tries ?? 0) + 1;
+  if (tries > REDIAL_TRIES) {
+    redials.delete(peer.id);
+    toast(`Couldn't connect to ${name}. Check that both are on the same Wi‑Fi, or pair with the code.`);
+    return;
+  }
+  if (tries === 1) toast(wasReady ? `Lost the connection to ${name}. Trying again…` : `Couldn't connect to ${name}. Trying again…`);
+  const timer = setTimeout(() => {
+    redials.set(peer.id, { tries, timer: null });
+    const current = relay.peers.get(peer.id);
+    if (current) dialers.get(relay)?.(current);
+    render();
+  }, Math.min(30_000, 2_000 * 2 ** (tries - 1)));
+  redials.set(peer.id, { tries, timer });
+}
+
 // MARK: Pairing
 
 async function newPairing() {
-  pairRelay?.stop();
+  unwatch(pairRelay);
   pairRelay = null;
   let next;
   try {
@@ -119,7 +189,7 @@ async function newPairing() {
 function pairingUsed(winner) {
   const used = pairing;
   pairing = null;
-  pairRelay?.stop();
+  unwatch(pairRelay);
   pairRelay = null;
   if (used.connection !== winner) used.connection.close("superseded");
   pairingNote = "";
@@ -153,6 +223,7 @@ function wireCodeForm() {
 function adopt(key, connection) {
   connections.set(key, connection);
   connection.addEventListener("ready", () => {
+    if (connection.relayPeerId) redials.delete(connection.relayPeerId);
     if (pairing && connection.secret === pairing.secret) pairingUsed(connection);
     dedupe(connection);
     if (connection.state === "ready") toast(`${connection.app.name} connected`);
@@ -164,9 +235,11 @@ function adopt(key, connection) {
     connections.delete(key);
     connection.discard();
     const { reason, wasReady } = e.detail;
-    if (reason === "duplicate" && connection.relayPeerId) retired.add(connection.relayPeerId);
-    if (wasReady && reason !== "duplicate" && reason !== "page closed") toast(`${connection.app.name} stopped sharing`);
+    const name = connection.app?.name || "The device";
+    if (wasReady && reason === "bye") toast(`${name} stopped sharing`);
+    if (wasReady && connection.via !== "relay" && REDIAL_REASONS.has(reason)) toast(`Lost the connection to ${name}.`);
     if (reason === "bad-proof") toast("A device couldn't prove it was the one you paired with, so it was disconnected.");
+    release(connection);
     if (pairing && connection === pairing.connection) {
       // The waiting connection gave up (a wrong code can do it): make another.
       pairingNote = "That didn't connect. Here's a fresh code. Scan it again.";
@@ -177,15 +250,36 @@ function adopt(key, connection) {
   });
 }
 
-/** One connection per app session: keep the trusted one, else the first. */
+/**
+ * One card per device, as far as that can be told. The app's `session` says two
+ * connections reach the same Share screen, but anyone in the same room can copy it into a
+ * hello, so it's a hint, not an identity: the only thing it decides is that a trusted
+ * connection (one that proved it holds the secret) replaces an untrusted one with the same
+ * session. Two untrusted connections that claim one session are both kept, each with its
+ * own check number, which is what the number is for: closing either would let an
+ * impostor that connected first, or that is up when the real device redials, keep the
+ * real device off the page. The loser's relay peer is held back only while the winner lives.
+ */
 function dedupe(connection) {
   const session = connection.app?.session;
   if (!session) return;
   for (const other of connections.values()) {
     if (other === connection || other.state !== "ready" || other.app?.session !== session) continue;
-    const loser = connection.trusted && !other.trusted ? other : connection;
-    loser.close("duplicate");
-    return;
+    if (!connection.trusted || other.trusted) continue;
+    if (other.relayPeerId) retired.set(other.relayPeerId, connection);
+    other.close("duplicate");
+  }
+}
+
+/** The connection is gone, so the peers it beat may be dialed again. */
+function release(connection) {
+  for (const [id, winner] of [...retired]) {
+    if (winner !== connection) continue;
+    retired.delete(id);
+    for (const [relay, dial] of dialers) {
+      const peer = relay.peers.get(id);
+      if (peer) dial(peer);
+    }
   }
 }
 
@@ -273,9 +367,11 @@ class DeviceCard {
     this.connection = connection;
     this.rows = new Map();
     this.uploads = new Map();
+    this.noted = new Set();
     this.icon = h("span", { class: "device-icon", "aria-hidden": "true" });
     this.name = h("h2", { class: "device-name" });
     this.badge = h("span", { class: "badge" });
+    this.check = h("p", { class: "check small", hidden: true });
     this.docList = h("ul", { class: "docs" });
     this.noDocs = h("p", { class: "muted small" }, "Nothing shared right now.");
     this.uploadList = h("ul", { class: "uploads" });
@@ -283,6 +379,7 @@ class DeviceCard {
     this.sendButton = h("button", { class: "button quiet", type: "button", onclick: () => this.picker.click() }, icon("upload"), h("span", {}, "Send files"));
     this.el = h("article", { class: "device card" },
       h("header", { class: "device-head" }, this.icon, h("div", {}, this.name, this.badge)),
+      this.check,
       this.docList,
       this.noDocs,
       h("div", { class: "send" }, this.sendButton, this.picker, h("span", { class: "muted small" }, "PDFs and images, or drop them here")),
@@ -310,8 +407,9 @@ class DeviceCard {
     }
     this.name.textContent = c.app?.name || "Rescriva";
     const ready = c.state === "ready";
-    this.badge.textContent = !ready ? "Connecting…" : c.trusted ? "Paired: no PINs needed" : "Type each file's PIN to download";
+    this.badge.textContent = !ready ? "Connecting…" : c.trusted ? "Paired: no PINs needed" : "A PIN unlocks each file";
     this.badge.dataset.tone = ready && c.trusted ? "good" : "";
+    this.renderCheck(ready && !c.trusted);
     this.el.classList.toggle("connecting", !ready);
     this.sendButton.disabled = !ready;
     this.sendButton.lastChild.textContent = `Send to ${c.app?.name || "Rescriva"}`;
@@ -333,6 +431,29 @@ class DeviceCard {
       row.update(doc);
     }
     this.noDocs.hidden = !ready || c.docs.length > 0;
+  }
+
+  /**
+   * On a connection with no secret, nothing proves the card is the person's own device: the
+   * PIN only lets this page download. So the card carries the connection's check number, and
+   * Rescriva shows the same number next to this computer. The person compares them: a match
+   * means the two ends almost certainly see the same connection, a mismatch means they don't.
+   */
+  renderCheck(shown) {
+    this.check.hidden = !shown;
+    if (!shown) return;
+    const number = this.connection.checkNumber;
+    const key = number ?? "none";
+    if (this.check.dataset.number === key) return;
+    this.check.dataset.number = key;
+    if (number) {
+      this.check.replaceChildren(
+        "Check number ", h("b", { class: "check-number" }, formatCheckNumber(number)),
+        ". Before typing a PIN, find this computer in Rescriva's Connected list and check its number: matching numbers mean the card and that row are the same connection. If they differ, this card isn't your device.",
+      );
+    } else {
+      this.check.textContent = "This connection has no check number, so there's no way to tell it's really your device. Don't type a PIN into it.";
+    }
   }
 
   send(files) {
@@ -361,11 +482,28 @@ class DeviceCard {
       moving: `Sending · ${percent(t)}`,
       finishing: "Saving…",
       saved: `Saved in Rescriva on ${who}`,
-      declined: t.note === "type" ? "Not sent: Rescriva takes PDFs and images" : "Declined",
-      failed: "Didn't send",
+      declined: {
+        type: "Not sent: Rescriva takes PDFs and images",
+        busy: `Not sent: ${who} is still receiving another file. Try again in a moment.`,
+        size: "Not sent: too big. Rescriva takes PDFs up to 1 GB and images up to 128 MB.",
+      }[t.note] || `Not accepted on ${who}`,
+      failed: {
+        stalled: "Stopped: nothing moved for 30 seconds",
+        cancelled: `Cancelled on ${who}`,
+        timeout: `No answer from ${who}`,
+        "not-saved": `${who} couldn't save it`,
+      }[t.note] || "Didn't send",
     }[t.state] || "";
+    this.noteStall(t);
     row.bar.set(t.state === "moving" ? t.done / t.size : t.state === "saved" || t.state === "finishing" ? 1 : 0, t.state === "moving" || t.state === "finishing");
     row.el.dataset.state = t.state;
+  }
+
+  /** A stalled transfer gets one toast, since its row may be out of view. */
+  noteStall(t) {
+    if (t.state !== "failed" || t.note !== "stalled" || this.noted.has(t.id)) return;
+    this.noted.add(t.id);
+    toast(`Nothing moved for 30 seconds, so “${t.name}” was stopped.`);
   }
 }
 
@@ -417,7 +555,7 @@ class DocRow {
   openPin() {
     this.pinForm.hidden = false;
     this.action.hidden = true;
-    this.message.textContent = `Type the PIN shown next to “${this.doc.name}” in Rescriva.`;
+    this.message.textContent = `Type the PIN shown next to “${this.doc.name}” in Rescriva, once the check number above matches.`;
     this.pin.focus();
   }
 
@@ -455,17 +593,32 @@ class DocRow {
   }
 
   transfer(t) {
+    // The row follows its latest download; an older one being forgotten doesn't speak for it.
+    if (t.state === "waiting") this.transferId = t.id;
+    if (t.id !== this.transferId) return;
     this.transferState = t.state;
     this.bar.set(t.size ? t.done / t.size : 0, t.state === "moving");
     if (t.state === "requested" || t.state === "waiting") this.message.textContent = "Starting…";
     else if (t.state === "moving") this.message.textContent = `Downloading · ${percent(t)}`;
-    else if (t.state === "failed") this.message.textContent = t.note === "locked" ? "Locked. Enter the PIN first." : "The download stopped. Try again.";
-    else if (t.state === "done") {
+    else if (t.state === "failed") {
+      this.message.textContent = {
+        locked: "Locked. Enter the PIN first.",
+        gone: "This file isn't shared any more.",
+        timeout: "No answer from the device. Is Rescriva still open?",
+        stalled: "The download stopped: nothing arrived for 30 seconds. Try again.",
+        size: "The device sent more than it said it would, so the download was stopped.",
+        type: "Not downloaded: this device isn't paired, so only PDFs, images, Word, PowerPoint, Markdown and text files are taken from it.",
+        listed: "Not downloaded: the file isn't the size this device listed, or it's bigger than the page takes from a device it isn't paired with.",
+        disk: "Couldn't write the file here. Try again.",
+        cancelled: "Cancelled.",
+      }[t.note] || "The download stopped. Try again.";
+      this.card.noteStall(t);
+    } else if (t.state === "done" && t.url) {
       this.message.replaceChildren(
         "Downloaded. ",
         h("a", { href: t.url, download: t.name, onclick: (e) => { e.preventDefault(); saveFile(t.url, t.name); } }, "Save again"),
       );
-    }
+    } else if (t.state === "done") this.message.textContent = "Downloaded.";
     this.update(this.doc);
   }
 }
@@ -504,7 +657,7 @@ function percent(t) {
 
 /** Like the app's sizes (Apple's file sizes): 1 KB is 1,000 bytes, so both show "731 KB". */
 function formatBytes(bytes) {
-  if (!(bytes >= 0)) return "";
+  if (bytes == null || !(bytes >= 0)) return "";
   if (bytes < 1000) return `${bytes} bytes`;
   if (Math.round(bytes / 1e3) < 1000) return `${Math.round(bytes / 1e3)} KB`;
   if (bytes < 1e9) return `${(bytes / 1e6).toFixed(1)} MB`;

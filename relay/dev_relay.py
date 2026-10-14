@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """Local stand-in for the Rescriva Share relay (worker.js), for testing without Cloudflare.
 
-    python3 dev_relay.py [--host 127.0.0.1] [--port 8787] [--max-peers 32] [--stale-after 120]
+    python3 dev_relay.py [--host 127.0.0.1] [--port 8787] [--max-peers 32] [--max-per-ip 4]
+                         [--stale-after 120] [--connections-per-minute 0]
 
 Python 3.9+, standard library only. Same URL, query parameters, messages and limits as the
 Worker. Every room=auto client lands in one room, since everything here is localhost.
 EXTRA_ORIGINS (comma-separated) works as an environment variable, like the Worker's.
+
+A client's address is its CF-Connecting-IP header when it sends one (Cloudflare sets that
+header on the real relay; here test_relay.py sends it to act as several addresses), otherwise
+the socket's own address. As in the Worker, the per-address limits count an IPv4 address or an
+IPv6 /64, and the per-address room cap applies to pairing rooms only (an auto room is one
+address). --connections-per-minute stands in for the Worker's WS_LIMIT binding and is off by
+default, like a Worker deployed without the binding.
 """
 
 import argparse
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -31,7 +40,8 @@ LOCAL_ORIGIN = re.compile(r"http://(localhost|127\.0\.0\.1)(:\d{1,5})?")
 UNSAFE_CHARS = re.compile("[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]")
 PING = '{"t":"ping"}'
 PONG = '{"t":"pong"}'
-REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 426: "Upgrade Required"}
+REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 426: "Upgrade Required",
+           429: "Too Many Requests"}
 
 OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
@@ -88,9 +98,10 @@ class ProtocolError(Exception):
 
 
 class Peer:
-    def __init__(self, reader, writer, room_key, role, name, device):
+    def __init__(self, reader, writer, room_key, ip, role, name, device):
         self.reader, self.writer = reader, writer
         self.room_key = room_key
+        self.ip = ip  # never sent to other peers
         self.id = new_id()
         self.role, self.name, self.device = role, name, device
         self.seen = time.monotonic()
@@ -127,11 +138,15 @@ class Peer:
 
 
 class Relay:
-    def __init__(self, max_peers, stale_after, extra_origins):
+    def __init__(self, max_peers, max_per_ip, stale_after, rate, extra_origins):
         self.max_peers = max_peers
+        self.max_per_ip = max_per_ip
         self.stale_after = stale_after
+        self.rate = rate  # new connections a minute per address; 0 = no limit
+        # Empty entries (an unset variable, a trailing comma) are dropped so an empty Origin never passes.
         self.extra_origins = {o.strip().rstrip("/").lower() for o in extra_origins.split(",") if o.strip()}
         self.rooms = {}  # room key -> {peer id: Peer}
+        self.windows = {}  # address -> (window start, connections in it)
 
     def origin_allowed(self, origin):
         if origin == "https://share.rescriva.com" or LOCAL_ORIGIN.fullmatch(origin):
@@ -165,9 +180,6 @@ class Relay:
             return await self.connect(reader, writer, url.query, headers)
         if get and url.path == "/":
             return respond(writer, method, 200, "Rescriva Share relay\n")
-        if get and url.path == "/health":
-            extra = [f"Access-Control-Allow-Origin: {origin}", "Vary: Origin"] if origin else []
-            return respond(writer, method, 200, "ok", extra)
         return respond(writer, method, 404, "not found\n")
 
     async def connect(self, reader, writer, query, headers):
@@ -194,22 +206,25 @@ class Relay:
             return respond(writer, "GET", 400, "bad device\n")
         name = clean_name(q.get("name", ""))
         room_key = "net:local" if room == "auto" else "p:" + room
+        ip = address_key(client_ip(headers, writer))
+        if self.rate and not self.within_limit(ip):
+            return respond(writer, "GET", 429, "too many connections, try again in a minute\n", ["Retry-After: 60"])
 
         writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                       f"Sec-WebSocket-Accept: {accept_for(key)}\r\n\r\n").encode())
         await writer.drain()
 
-        peer = Peer(reader, writer, room_key, role, name, device)
+        peer = Peer(reader, writer, room_key, ip, role, name, device)
         await self.sweep_stale(room_key)
-        members = self.rooms.setdefault(room_key, {})  # no awaits from here until the peer is added
+        members = self.rooms.get(room_key, {})  # no awaits from here until the peer is added or refused
         if len(members) >= self.max_peers:
-            log("full ", short_room(room_key), f"refused {role}/{device}")
-            await peer.send_text(dumps({"t": "error", "message": "room full"}))
-            await peer.close(1008, "room full")
-            return
+            return await self.refuse(peer, "room full")
+        # Pairing rooms only, like the Worker: an auto room already is one address.
+        if room != "auto" and sum(1 for p in members.values() if p.ip == ip) >= self.max_per_ip:
+            return await self.refuse(peer, "too many connections")
 
         others = list(members.values())
-        members[peer.id] = peer
+        self.rooms.setdefault(room_key, members)[peer.id] = peer
         log("join ", short_room(room_key), peer.id, f"{role}/{device}", repr(name), f"({len(members)} in room)")
         await peer.send_text(dumps({"t": "welcome", "id": peer.id, "peers": [p.info() for p in others]}))
         join = dumps({"t": "join", "peer": peer.info()})
@@ -224,6 +239,23 @@ class Relay:
         finally:
             peer.abort()
             await self.leave(peer)
+
+    async def refuse(self, peer, reason):
+        log("refuse", short_room(peer.room_key), f"{peer.role}/{peer.device}", reason)
+        await peer.send_text(dumps({"t": "error", "message": reason}))
+        await peer.close(1008, reason)
+
+    def within_limit(self, ip):
+        """Counts a connection attempt; False once the address is over --connections-per-minute."""
+        # A fixed one-minute window per address, which is roughly what the Worker's binding does.
+        now = time.monotonic()
+        if len(self.windows) > 1000:
+            self.windows = {k: v for k, v in self.windows.items() if now - v[0] < 60}
+        start, count = self.windows.get(ip, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        self.windows[ip] = (start, count + 1)
+        return count < self.rate
 
     # ---- WebSocket ----
 
@@ -315,6 +347,8 @@ class Relay:
         target = self.rooms.get(peer.room_key, {}).get(to)
         if target is None or target is peer or target.left:
             return
+        if target.role == peer.role:  # only web <-> app (PROTOCOL.md §2)
+            return
         log("signal", short_room(peer.room_key), f"{peer.id} -> {target.id}", signal_kind(data))
         await target.send_text(dumps({"t": "signal", "from": peer.id, "data": data}))
 
@@ -338,6 +372,28 @@ class Relay:
                 log("stale", short_room(p.room_key), p.id)
                 await p.close(4408, "stale")
                 await self.leave(p)
+
+
+def client_ip(headers, writer):
+    ip = headers.get("cf-connecting-ip", "").strip()
+    if ip:
+        return ip
+    peer = writer.get_extra_info("peername")
+    return peer[0] if peer else "local"
+
+
+def address_key(ip):
+    """What the per-address limits count by: an IPv4 address as it is, an IPv6 address as its /64
+    (a host can give itself any address in its /64), anything else as it is."""
+    try:
+        address = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return ip
+    if address.version == 4:
+        return str(address)
+    if address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return str(ipaddress.ip_network((address, 64), strict=False).network_address.exploded[:19])
 
 
 def parse_request(head):
@@ -386,14 +442,25 @@ async def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--max-peers", type=int, default=int(os.environ.get("RELAY_MAX_PEERS", "32")),
                     help="peer cap per room (default 32; lower it to test the 'room full' path)")
+    ap.add_argument("--max-per-ip", type=int, default=4,
+                    help="peers one address (IPv4, or an IPv6 /64) may hold in a pairing room (default 4, like the Worker)")
     ap.add_argument("--stale-after", type=float, default=120.0,
                     help="seconds of silence before a peer is dropped when someone joins (default 120)")
+    ap.add_argument("--connections-per-minute", type=int, default=0,
+                    help="new connections a minute per address, answered 429 above that (default 0: no limit)")
     args = ap.parse_args()
     if args.max_peers < 1:
         ap.error("--max-peers must be at least 1")
-    relay = Relay(args.max_peers, args.stale_after, os.environ.get("EXTRA_ORIGINS", ""))
+    if args.max_per_ip < 1:
+        ap.error("--max-per-ip must be at least 1")
+    if args.connections_per_minute < 0:
+        ap.error("--connections-per-minute can't be negative")
+    relay = Relay(args.max_peers, args.max_per_ip, args.stale_after, args.connections_per_minute,
+                  os.environ.get("EXTRA_ORIGINS", ""))
     server = await asyncio.start_server(relay.handle, args.host, args.port)
-    log(f"Rescriva Share dev relay on ws://{args.host}:{args.port}/ws (max {args.max_peers} peers a room)")
+    rate = f", {args.connections_per_minute} connections a minute an address" if args.connections_per_minute else ""
+    log(f"Rescriva Share dev relay on ws://{args.host}:{args.port}/ws "
+        f"(max {args.max_peers} peers a room, {args.max_per_ip} an address{rate})")
     async with server:
         await server.serve_forever()
 

@@ -5,7 +5,10 @@ Rescriva app (iPhone, iPad, Mac) and any browser, directly from device to device
 It's served by GitHub Pages at **https://share.rescriva.com**.
 
 - **Same network:** open the page, open Share Nearby in Rescriva, and the device's shared
-  documents appear. Each one needs the PIN shown in the app to download.
+  documents appear. Each one needs the PIN shown in the app to download. The PIN lets the page
+  download; it doesn't prove the card is your device, so the page and the app both show a
+  nine-digit check number for the connection. Compare them before typing a PIN: matching
+  numbers mean the card and the app's row are the same connection.
 - **The app's QR code:** scanning it with a phone opens this page already paired, with no PINs.
 - **No relay or internet:** Rescriva scans the QR code on this page. If the computer won't
   accept the connection, the app shows a short code to type here.
@@ -21,7 +24,7 @@ connection. See [PROTOCOL.md](PROTOCOL.md).
 | `assets/config.js` | The relay URL and the app certificate's fingerprint. |
 | `assets/vendor/qrcode.js` | [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) 1.4.4, MIT. |
 | `sw.js` | Keeps a copy of the page so it opens offline (hotspot with no signal). |
-| `tests/` | Checks the page's encodings against PROTOCOL.md's test vectors. |
+| `tests/` | Checks the page's encodings and the check number against PROTOCOL.md's test vectors, and what an unpaired device's file may be saved as. |
 | `relay/` | The Cloudflare Worker relay and a local stand-in. See `relay/README.md`. |
 | `CNAME`, `.nojekyll` | GitHub Pages settings. |
 

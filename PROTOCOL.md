@@ -2,7 +2,8 @@
 
 Rescriva Share moves files between the Rescriva app (iPhone, iPad, Mac) and a web page
 (`https://share.rescriva.com`, served by GitHub Pages). Files always travel over a direct,
-encrypted WebRTC data channel between the two devices. Nothing else ever sees them.
+encrypted WebRTC data channel between the two devices. The relay carries only the text that
+sets a connection up, never a file; what that leaves it able to do is in §1.2.
 
 Before a WebRTC connection can open, the two ends must swap a short "hello" (an SDP offer and an
 SDP answer). A static web page has no server to carry it, so there are two ways to do that:
@@ -37,6 +38,21 @@ proof(secret, role, fpOffer, fpAnswer)
   (`a=fingerprint:sha-256 AB:CD:…`), as upper-case hex pairs joined by `:`. Each side uses the
   descriptions it actually applied, so a relay that swapped fingerprints can't produce a valid proof.
 
+A connection with no secret has no `proof`. It gets a **check number** instead, from the same
+two fingerprints, which both ends show (§1.2):
+
+```
+checkNumber(fpOffer, fpAnswer)
+                = SHA-256( "rescriva-share/check/v1|" + fpOffer + "|" + fpAnswer )
+                  [0..<8] as a big-endian uint64, mod 1 000 000 000
+```
+
+- Shown as nine digits, zero-padded, in three groups of three: `424 561 948`.
+- Nine digits, not six, because the number has no commitment in it: the side that answers
+  (the app, or anything playing it) sees `fpOffer` before it picks its own certificate, and
+  could try certificates until the number came out as it wanted. A million tries fits a
+  connection's window on a laptop; a billion doesn't.
+
 Test vectors (secret = bytes `01 02 … 10`, base64url `AQIDBAUGBwgJCgsMDQ4PEA`):
 
 | Value | Result |
@@ -45,6 +61,8 @@ Test vectors (secret = bytes `01 02 … 10`, base64url `AQIDBAUGBwgJCgsMDQ4PEA`)
 | `iceUfrag` / `icePwd` | `JtdLkDQk` / `ZQTXo83Ch4FIONXev/7A54ci` |
 | `proof(web, "AA:"×31+"AA", "BB:"×31+"BB")` | `EpXFwY-xYQ-Pv7kuSqaHTPV91p-Nb4n2AtMQU9ZLUGk` |
 | `proof(app, same)` | `NuogRNgcibvc8iD5AZFpJUq_MdvVGuhpw622Z3WAd3M` |
+| `checkNumber("AA:"×31+"AA", "BB:"×31+"BB")` | `424561948` |
+| `checkNumber`, fingerprints swapped | `576993692` |
 
 ### 1.2 Trust: key or PIN
 
@@ -53,12 +71,38 @@ because the app scanned the page's QR code) is **trusted**: every shared documen
 for it. It proves this with `proof` in its `hello`. Every other page (found through the relay's
 same-network room) sees document names but must type each document's **PIN** to download it.
 
+The PIN proves the page to the app, not the app to the page. Anything that joins the
+same-network room as `app` can call itself "iPhone" and list the same document names, and a
+PIN typed into it would unlock the real device for it. So on a connection with no secret both
+ends show the connection's **check number** (§1.1): the app next to the connected computer, the
+page on the device's card. Matching numbers mean the two ends almost certainly see the same
+connection; a mismatch means they don't. The person compares them before typing a PIN. The
+number is a check for a person to make, not an authentication: a page that never shows it to
+anyone is no safer, and a determined attacker on the same network, who can connect to the
+real app as a page and to the real page as an app, can still try certificates until a short
+number matched (nine digits make that take a billion tries, which is why it isn't six). With
+such an attacker in the room, the app's "more than one computer" warning and the page's
+second card for the same device are the signs to look for.
+
+A session with no secret also trusts the relay. With no `proof` to check, a relay that swapped
+fingerprints and put in its own candidates would sit between the two ends, reading document
+names, the typed PIN and every file. The check number would not match then either, which is
+the other reason to compare it. With a secret, `proof` binds the fingerprints each end applied,
+so the relay can only pass messages or drop them.
+
+The eventual fix for both is to replace `unlock {pin}` with a PAKE (SPAKE2 or CPace) keyed on
+the PIN and bound to `fpOffer|fpAnswer`, so an impostor learns at most that one guess was wrong
+and nothing it saw can be replayed. The check number is the interim.
+
 ### 1.3 PINs
 
 Each shared document gets its own 6-digit PIN when the Share screen opens. PINs are unique within
 the session and are replaced when the Share screen closes or the app leaves the foreground.
-Five wrong tries on a document replaces that document's PIN and refuses tries on it for
-30 s, doubling each time it happens again. The app shows the new PIN.
+Wrong tries are counted per connection, so one page can't lock everyone out: five wrong from one
+connection refuse that connection for 30 s (`denied` with `left: 0` and `retryIn`); other
+connections carry on. Only when wrong tries across every connection reach 15, or three
+connections have each been refused, is the document's PIN replaced and every connection refused
+for 30 s, doubling each time it happens again up to 32 minutes. The app shows the new PIN.
 
 ## 2. Relay
 
@@ -96,9 +140,27 @@ Signal `data` is one of:
 
 **The web page always makes the offer**: it connects to every `app` peer in its room (from
 `welcome` and later `join`s). The app answers. Web pages never connect to each other; apps never
-connect to each other. Limits: 32 peers a room, 64 KB a message. Origins other than
+connect to each other, and the relay enforces that: a `signal` is delivered only between a `web`
+peer and an `app` peer; one addressed to a peer of the sender's own role is dropped without a
+reply. Limits: 32 peers a room, 64 KB a message (bigger messages are dropped). Origins other than
 `https://share.rescriva.com` and `http://localhost:*` / `http://127.0.0.1:*` are refused; native
 clients send no Origin.
+
+Refusals a client has to expect, and back off from rather than retry at once:
+
+- **Room full.** The 33rd socket into a room is accepted only to be told
+  `{"t":"error","message":"room full"}` and closed with code 1008 and that reason.
+- **Too many connections.** In a pairing room (`roomId(secret)`), one public address may hold
+  4 peers; the fifth is told `{"t":"error","message":"too many connections"}` and closed with
+  code 1008 and that reason, the same shape as "room full". A public address is an IPv4
+  address, or for IPv6 the /64. The `auto` room has no per-address cap: an IPv4 auto room is one
+  public address by construction, so only the 32-peer cap applies there.
+- **Connection budget.** New connections are budgeted per public address (again an IPv4 address
+  or an IPv6 /64): 20 a minute, plus an edge rule at the relay's host. Over that the WebSocket
+  upgrade fails with HTTP 429 and `Retry-After: 60`; both clients keep their exponential
+  back-off, so they recover by themselves.
+
+`GET /` answers `Rescriva Share relay`; there is no `/health` (anything else is 404).
 
 ## 3. No-relay pairing (the page's QR code)
 
@@ -205,7 +267,14 @@ Both sides send `hello` as soon as the channel opens:
 
 The app's `hello` also carries `"session"`, 8 random bytes in base64url that are new each time the
 Share screen opens. A page that reaches the same app two ways (the same-network room and a
-pairing) keeps one connection per session and prefers the trusted one.
+pairing) keeps one connection per session. But `session` goes to every page in the room in clear,
+so to the page it's a hint, not an identity, and the only thing it ever decides is
+trusted-over-untrusted: a connection whose `hello` carried a valid `proof` replaces an untrusted
+one with the same `session` (that relay peer isn't dialed again until the trusted connection is
+gone, or the relay says the peer left and came back). Two untrusted connections that claim one
+`session` are both kept, each with its own check number: closing either would let whichever
+connected first keep the other off the page, which is exactly what an impostor copying a
+`session` would want.
 
 `proof` is present when the sender holds a secret for this connection (§1.1). The receiver
 checks it. A wrong proof means the receiver sends `{"t":"bye"}` and closes. The page does nothing
@@ -215,7 +284,7 @@ arrives.
 App → page:
 
 ```
-{"t":"docs","docs":[{"id","name","size","type","unlocked":bool}, …]}   // whenever the list or a lock changes; [] when sharing ends
+{"t":"docs","docs":[{"id","name","size","type","unlocked":bool}, …]}   // whenever the list or a lock changes; [] when sharing ends; at most 200 (the page ignores the rest)
 {"t":"unlocked","id"}
 {"t":"denied","id","reason":"wrong"|"cooldown"|"locked"|"gone","retryIn":seconds?,"left":tries?}
 {"t":"file","id","xfer","name","size","type"}  // then binary chunks, then {"t":"end","xfer"}
@@ -237,6 +306,25 @@ One transfer per direction at a time. Binary frames from the app always belong t
 `file`, and binary frames from the page always belong to the current accepted `send`. Senders
 keep `bufferedAmount` under 1 MiB. The app accepts PDFs and images (`application/pdf`, `image/*`)
 and asks its user before every `send`.
+
+The page saves a `file` under the name from its `docs` entry, never the `name` in `file`. The
+name is cleaned first: path separators and control characters become `_`, bidi overrides and
+isolates (U+202A–202E, U+2066–2069) are dropped, leading dots and spaces go (so nothing lands
+as a hidden file), and it's clipped to 200 characters including any extension added. From a
+connection with no secret it takes only `application/pdf`, the plain image types it knows
+(`image/png`, `image/jpeg`, `image/heic`, `image/heif`, `image/gif`, `image/webp`,
+`image/tiff`) and the app's own export formats
+(`application/vnd.openxmlformats-officedocument.wordprocessingml.document` → `.docx`,
+`application/vnd.openxmlformats-officedocument.presentationml.presentation` → `.pptx`,
+`text/markdown` → `.md`, `text/plain` → `.txt`), saved under an extension that matches the
+type (added when the name lacks it, so a "Scan.pdf.exe" sent as a PDF lands as
+"Scan.pdf.exe.pdf"); any other type is refused on the page before `get` is sent, and a `file`
+of another type is answered with `cancel`. From such a connection the size is the `docs`
+entry's too: a `file` whose `size` differs from it, or is over what the app itself accepts
+(1 GiB for a PDF, 128 MiB for anything else), is answered with `cancel`; and a `size` that
+isn't a whole number of bytes is refused on every connection. Either side gives up on a
+transfer with nothing moving for 30 s, and the page stops a download the moment more bytes
+arrive than `size` said, with `cancel` both times.
 
 When the app's Share screen closes or the app leaves the foreground, it sends `docs: []` and
 `bye`, then closes every connection and leaves the relay. The page removes that device.

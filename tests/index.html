@@ -6,8 +6,9 @@
 <pre id="out">Running…</pre>
 <script type="module">
 import { b64url, fromB64url, decodeConnectionCode, encodeConnectionCode, pairingPayload, fingerprintBytes } from "../assets/codes.js";
-import { roomId, iceCredentials, proof } from "../assets/crypto.js";
+import { checkNumber, formatCheckNumber, roomId, iceCredentials, proof } from "../assets/crypto.js";
 import { fingerprint, hostCandidates, syntheticAnswer, sdpValue } from "../assets/sdp.js";
+import { byteCount, cleanFileName, maxUntrustedBytes, savedName } from "../assets/peer.js";
 
 const results = [];
 const check = (name, actual, expected) => {
@@ -24,6 +25,26 @@ check("ice", await iceCredentials(secret), { ufrag: "JtdLkDQk", pwd: "ZQTXo83Ch4
 const fo = Array(32).fill("AA").join(":"), fa = Array(32).fill("BB").join(":");
 check("proof web", await proof(secret, "web", fo, fa), "EpXFwY-xYQ-Pv7kuSqaHTPV91p-Nb4n2AtMQU9ZLUGk");
 check("proof app", await proof(secret, "app", fo, fa), "NuogRNgcibvc8iD5AZFpJUq_MdvVGuhpw622Z3WAd3M");
+check("check number", await checkNumber(fo, fa), "424561948");
+check("check number, fingerprints swapped", await checkNumber(fa, fo), "576993692");
+check("check number shown", formatCheckNumber("424561948"), "424 561 948");
+
+// §4: what an unpaired device's file may be saved as.
+check("pdf keeps its name", savedName("Scan 2026-10-12.pdf", "application/pdf"), "Scan 2026-10-12.pdf");
+check("upper-case extension counts", savedName("Scan.PDF", "application/pdf"), "Scan.PDF");
+check("wrong extension gets the right one after it", savedName("Scan.pdf.exe", "application/pdf"), "Scan.pdf.exe.pdf");
+check("jpeg spelt either way", [savedName("a.jpeg", "image/jpeg"), savedName("a.jpg", "image/jpeg"), savedName("a", "image/jpeg")], ["a.jpeg", "a.jpg", "a.jpg"]);
+check("type parameters ignored", savedName("a.png", "image/PNG; charset=binary"), "a.png");
+check("other types refused", [savedName("a.pdf", "application/x-msdownload"), savedName("a.svg", "image/svg+xml"), savedName("a", "")], [null, null, null]);
+check("the app's export formats are taken", [savedName("Notes", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"), savedName("Deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"), savedName("Notes.md", "text/markdown"), savedName("Notes", "text/plain")], ["Notes.docx", "Deck.pptx", "Notes.md", "Notes.txt"]);
+check("path parts and leading dots go", cleanFileName("../.\\.hidden/x.pdf"), "_._.hidden_x.pdf");
+check("leading spaces don't shelter a dot", [cleanFileName(" .hidden"), cleanFileName(" . .ssh"), savedName("  .evil.pdf", "application/pdf")], ["hidden", "ssh", "evil.pdf"]);
+check("bidi overrides and isolates go", cleanFileName("Scan‮fdp.exe"), "Scanfdp.exe");
+check("C1 controls become underscores", cleanFileName("a\u0085b\u009fc"), "a_b_c");
+check("long names stay under 200 with the extension", savedName("x".repeat(300), "application/pdf").length, 200);
+check("empty name gets a stand-in", [cleanFileName("   "), cleanFileName(". . .")], ["Rescriva file", "Rescriva file"]);
+check("sizes are whole numbers of bytes", [byteCount(731_000), byteCount("12"), byteCount(0), byteCount(-1), byteCount(1.5), byteCount(1e300), byteCount("x"), byteCount(null)], [731_000, 12, 0, null, null, null, null, null]);
+check("unpaired size caps follow the app's", [maxUntrustedBytes("application/pdf"), maxUntrustedBytes("image/PNG; x"), maxUntrustedBytes("text/plain")], [1 << 30, 128 << 20, 128 << 20]);
 
 // §3.1 connection codes.
 const codes = [["172.20.10.1", 52453, "1K75G"], ["192.168.1.37", 54321, "80JBN1HG"], ["10.0.12.200", 61000, "G006CHVJ8Z"], ["172.16.5.9", 50000, "XC202GKGTGM"]];

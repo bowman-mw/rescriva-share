@@ -36,3 +36,23 @@ export async function iceCredentials(secret) {
 export async function proof(secret, role, fpOffer, fpAnswer) {
   return b64url(await hmac(secret, text(`rescriva-share/proof/v1|${role}|${fpOffer}|${fpAnswer}`)));
 }
+
+/**
+ * The nine-digit check number for a connection with no secret (PROTOCOL.md §1.1): the
+ * app shows it next to the connected computer, the page on the device card, and the
+ * person compares them before typing a PIN. Fingerprints as `proof` takes them. Nine
+ * digits (the first eight digest bytes as a big-endian number, mod 10⁹), zero-padded;
+ * `formatCheckNumber` puts the spaces in. Nine rather than six because the side that
+ * answers picks its certificate after seeing the offer's fingerprint, so a short number
+ * could be ground into a match; a billion tries won't fit a connection's window.
+ */
+export async function checkNumber(fpOffer, fpAnswer) {
+  const digest = await sha256(text(`rescriva-share/check/v1|${fpOffer}|${fpAnswer}`));
+  const n = new DataView(digest.buffer, digest.byteOffset, 8).getBigUint64(0) % 1_000_000_000n;
+  return String(n).padStart(9, "0");
+}
+
+/** "424561948" → "424 561 948", the way both sides show it. */
+export function formatCheckNumber(digits) {
+  return `${digits.slice(0, 3)} ${digits.slice(3, 6)} ${digits.slice(6)}`;
+}

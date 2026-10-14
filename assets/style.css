@@ -257,6 +257,22 @@ h1, h2 { font-family: var(--serif); font-weight: 500; line-height: 1.2; margin: 
 .badge:empty { display: none; }
 .badge[data-tone="good"] { color: var(--ink); background: var(--wash); box-shadow: none; }
 
+/* The check number: the one line on an unpaired card to read before typing a PIN. */
+.check {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  color: var(--carbon);
+  background: var(--flag);
+  border-radius: var(--radius-chip);
+}
+.check-number {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Files read as a listing: rows ruled with hairlines. */
 .docs, .uploads { list-style: none; margin: 0; padding: 0; }
 .docs:not(:empty) { border-bottom: 1px solid var(--hairline); }
