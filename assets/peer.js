@@ -33,10 +33,12 @@ const BYE_LINGER = 300;
 const FINAL = new Set(["done", "saved", "declined", "failed"]);
 
 /**
- * What the page saves from a device it hasn't paired with (PROTOCOL.md §4): PDFs, images
- * and the app's own export formats (Word, PowerPoint, Markdown, plain text), under an
- * extension that matches the type. The first extension is the one added when the name
- * lacks one; the rest count as already having it.
+ * What the page saves from a device it hasn't paired with (PROTOCOL.md §4): PDFs, images,
+ * MP4 and QuickTime videos and the app's own export formats (Word, PowerPoint, Markdown,
+ * plain text), under an extension that matches the type. The first extension is the one
+ * added when the name lacks one; the rest count as already having it. A paired device's
+ * files are saved whatever their type. The app keeps a copy of this list
+ * (ShareLimits.unpairedPageTypes) to say which of its files only a paired page can take.
  */
 const SAVED_TYPES = {
   "application/pdf": [".pdf"],
@@ -47,6 +49,8 @@ const SAVED_TYPES = {
   "image/gif": [".gif"],
   "image/webp": [".webp"],
   "image/tiff": [".tiff", ".tif"],
+  "video/mp4": [".mp4"],
+  "video/quicktime": [".mov"],
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
   "application/vnd.openxmlformats-officedocument.presentationml.presentation": [".pptx"],
   "text/markdown": [".md", ".markdown"],
@@ -54,9 +58,10 @@ const SAVED_TYPES = {
 };
 
 /**
- * The most the page takes from an unpaired device in one file, by type: the app's own
- * limits for what it accepts (NearbyShareConfig), so a fake device can't stream into
- * memory or onto the disk without end. Paired devices are trusted with any size.
+ * The most the page takes from an unpaired device in one file, by type, so a fake device
+ * can't stream into memory or onto the disk without end. Paired devices are trusted with
+ * any size. The app keeps a copy (ShareLimits.unpairedPageMaxPDFBytes and
+ * unpairedPageMaxBytes).
  */
 const MAX_UNTRUSTED_BYTES = { "application/pdf": 1 << 30, "image/": 128 << 20, "": 128 << 20 };
 
@@ -658,5 +663,5 @@ async function openSink(name, type) {
 
 function typeFor(name) {
   const ext = name.split(".").pop().toLowerCase();
-  return { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", heic: "image/heic", gif: "image/gif", webp: "image/webp", tif: "image/tiff", tiff: "image/tiff" }[ext] || "application/octet-stream";
+  return { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", heic: "image/heic", heif: "image/heif", gif: "image/gif", webp: "image/webp", tif: "image/tiff", tiff: "image/tiff", mov: "video/quicktime", mp4: "video/mp4", m4v: "video/x-m4v" }[ext] || "application/octet-stream";
 }

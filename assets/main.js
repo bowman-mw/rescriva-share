@@ -375,14 +375,14 @@ class DeviceCard {
     this.docList = h("ul", { class: "docs" });
     this.noDocs = h("p", { class: "muted small" }, "Nothing shared right now.");
     this.uploadList = h("ul", { class: "uploads" });
-    this.picker = h("input", { type: "file", multiple: true, accept: "application/pdf,image/*", hidden: true, onchange: () => this.send(this.picker.files) });
+    this.picker = h("input", { type: "file", multiple: true, hidden: true, onchange: () => this.send(this.picker.files) });
     this.sendButton = h("button", { class: "button quiet", type: "button", onclick: () => this.picker.click() }, icon("upload"), h("span", {}, "Send files"));
     this.el = h("article", { class: "device card" },
       h("header", { class: "device-head" }, this.icon, h("div", {}, this.name, this.badge)),
       this.check,
       this.docList,
       this.noDocs,
-      h("div", { class: "send" }, this.sendButton, this.picker, h("span", { class: "muted small" }, "PDFs and images, or drop them here")),
+      h("div", { class: "send" }, this.sendButton, this.picker, h("span", { class: "muted small" }, "Photos and any other files, or drop them here")),
       this.uploadList,
     );
     this.el.addEventListener("dragover", (e) => {
@@ -481,11 +481,11 @@ class DeviceCard {
       asking: `Waiting for someone to tap Accept on ${who}…`,
       moving: `Sending · ${percent(t)}`,
       finishing: "Saving…",
-      saved: `Saved in Rescriva on ${who}`,
+      saved: `Saved on ${who}`,
       declined: {
-        type: "Not sent: Rescriva takes PDFs and images",
+        type: `Not sent: this version of Rescriva takes only PDFs and images. Update it on ${who} to send other files.`,
         busy: `Not sent: ${who} is still receiving another file. Try again in a moment.`,
-        size: "Not sent: too big. Rescriva takes PDFs up to 1 GB and images up to 128 MB.",
+        size: "Not sent: too big. Rescriva takes files up to 1 GB.",
       }[t.note] || `Not accepted on ${who}`,
       failed: {
         stalled: "Stopped: nothing moved for 30 seconds",
@@ -607,7 +607,7 @@ class DocRow {
         timeout: "No answer from the device. Is Rescriva still open?",
         stalled: "The download stopped: nothing arrived for 30 seconds. Try again.",
         size: "The device sent more than it said it would, so the download was stopped.",
-        type: "Not downloaded: this device isn't paired, so only PDFs, images, Word, PowerPoint, Markdown and text files are taken from it.",
+        type: "Not downloaded: this device isn't paired, so only PDFs, images, MP4 and QuickTime videos, Word, PowerPoint, Markdown and text files are taken from it. Pair with it to download other files.",
         listed: "Not downloaded: the file isn't the size this device listed, or it's bigger than the page takes from a device it isn't paired with.",
         disk: "Couldn't write the file here. Try again.",
         cancelled: "Cancelled.",

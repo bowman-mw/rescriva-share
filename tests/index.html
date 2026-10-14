@@ -36,6 +36,7 @@ check("wrong extension gets the right one after it", savedName("Scan.pdf.exe", "
 check("jpeg spelt either way", [savedName("a.jpeg", "image/jpeg"), savedName("a.jpg", "image/jpeg"), savedName("a", "image/jpeg")], ["a.jpeg", "a.jpg", "a.jpg"]);
 check("type parameters ignored", savedName("a.png", "image/PNG; charset=binary"), "a.png");
 check("other types refused", [savedName("a.pdf", "application/x-msdownload"), savedName("a.svg", "image/svg+xml"), savedName("a", "")], [null, null, null]);
+check("mp4 and quicktime videos are taken", [savedName("Clip.mp4", "video/mp4"), savedName("Clip", "video/quicktime"), savedName("Clip.webm", "video/webm")], ["Clip.mp4", "Clip.mov", null]);
 check("the app's export formats are taken", [savedName("Notes", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"), savedName("Deck.pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"), savedName("Notes.md", "text/markdown"), savedName("Notes", "text/plain")], ["Notes.docx", "Deck.pptx", "Notes.md", "Notes.txt"]);
 check("path parts and leading dots go", cleanFileName("../.\\.hidden/x.pdf"), "_._.hidden_x.pdf");
 check("leading spaces don't shelter a dot", [cleanFileName(" .hidden"), cleanFileName(" . .ssh"), savedName("  .evil.pdf", "application/pdf")], ["hidden", "ssh", "evil.pdf"]);
@@ -44,7 +45,7 @@ check("C1 controls become underscores", cleanFileName("a\u0085b\u009fc"), "a_b_c
 check("long names stay under 200 with the extension", savedName("x".repeat(300), "application/pdf").length, 200);
 check("empty name gets a stand-in", [cleanFileName("   "), cleanFileName(". . .")], ["Rescriva file", "Rescriva file"]);
 check("sizes are whole numbers of bytes", [byteCount(731_000), byteCount("12"), byteCount(0), byteCount(-1), byteCount(1.5), byteCount(1e300), byteCount("x"), byteCount(null)], [731_000, 12, 0, null, null, null, null, null]);
-check("unpaired size caps follow the app's", [maxUntrustedBytes("application/pdf"), maxUntrustedBytes("image/PNG; x"), maxUntrustedBytes("text/plain")], [1 << 30, 128 << 20, 128 << 20]);
+check("unpaired size caps", [maxUntrustedBytes("application/pdf"), maxUntrustedBytes("image/PNG; x"), maxUntrustedBytes("text/plain")], [1 << 30, 128 << 20, 128 << 20]);
 
 // §3.1 connection codes.
 const codes = [["172.20.10.1", 52453, "1K75G"], ["192.168.1.37", 54321, "80JBN1HG"], ["10.0.12.200", 61000, "G006CHVJ8Z"], ["172.16.5.9", 50000, "XC202GKGTGM"]];

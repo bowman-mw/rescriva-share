@@ -304,8 +304,14 @@ Either side: `{"t":"cancel","xfer"}`, `{"t":"bye"}`.
 
 One transfer per direction at a time. Binary frames from the app always belong to the current
 `file`, and binary frames from the page always belong to the current accepted `send`. Senders
-keep `bufferedAmount` under 1 MiB. The app accepts PDFs and images (`application/pdf`, `image/*`)
-and asks its user before every `send`.
+keep `bufferedAmount` under 1 MiB. The app accepts a file of any type, up to 1 GiB, and asks its
+user before every `send`. The type only decides where the app saves it: a PDF goes to PDF Files,
+the picture and video types Photos takes (JPEG, PNG, HEIC, HEIF, GIF, TIFF, WebP, BMP, DNG; MP4,
+QuickTime, M4V, 3GPP) go to Photos, and anything else, or anything that won't go where its type
+says, goes to the app's folder in Files (Downloads, on a Mac). A missing or malformed type reads
+as `application/octet-stream`. Versions before 2026-10-14 took only `application/pdf` and
+`image/*` and declined anything else with `reason: "type"`, so a page still explains that
+reason.
 
 The page saves a `file` under the name from its `docs` entry, never the `name` in `file`. The
 name is cleaned first: path separators and control characters become `_`, bidi overrides and
@@ -313,15 +319,16 @@ isolates (U+202A–202E, U+2066–2069) are dropped, leading dots and spaces go 
 as a hidden file), and it's clipped to 200 characters including any extension added. From a
 connection with no secret it takes only `application/pdf`, the plain image types it knows
 (`image/png`, `image/jpeg`, `image/heic`, `image/heif`, `image/gif`, `image/webp`,
-`image/tiff`) and the app's own export formats
+`image/tiff`), MP4 and QuickTime video (`video/mp4` → `.mp4`, `video/quicktime` → `.mov`)
+and the app's own export formats
 (`application/vnd.openxmlformats-officedocument.wordprocessingml.document` → `.docx`,
 `application/vnd.openxmlformats-officedocument.presentationml.presentation` → `.pptx`,
 `text/markdown` → `.md`, `text/plain` → `.txt`), saved under an extension that matches the
 type (added when the name lacks it, so a "Scan.pdf.exe" sent as a PDF lands as
 "Scan.pdf.exe.pdf"); any other type is refused on the page before `get` is sent, and a `file`
 of another type is answered with `cancel`. From such a connection the size is the `docs`
-entry's too: a `file` whose `size` differs from it, or is over what the app itself accepts
-(1 GiB for a PDF, 128 MiB for anything else), is answered with `cancel`; and a `size` that
+entry's too: a `file` whose `size` differs from it, or is over the page's caps for such a
+connection (1 GiB for a PDF, 128 MiB for anything else), is answered with `cancel`; and a `size` that
 isn't a whole number of bytes is refused on every connection. Either side gives up on a
 transfer with nothing moving for 30 s, and the page stops a download the moment more bytes
 arrive than `size` said, with `cancel` both times.
